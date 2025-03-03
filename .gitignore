@@ -1,4 +1,4 @@
 dataset
 DebugResult
 .vscode
-*/__pycache__
+__pycache__/

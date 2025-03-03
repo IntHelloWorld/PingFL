@@ -46,6 +46,29 @@ def auto_read(file):
     text = content.decode(detected_encoding)
     return text
 
+def filter_compile_error(log: str) -> str:
+    javac_lines = re.findall(r'\[javac\] .*\n', log)
+    javac_warning = r"\[javac\] .*warning: .*\n"
+    javac_error = r"(\[javac\] ).*(error: .*)\n"
+    javac_note = r"\[javac\] .*Note: .*\n"
+    error_lines = []
+    flag = False
+    for line in javac_lines:
+        if re.match(javac_warning, line):
+            flag = False
+        elif re.match(javac_note, line):
+            flag = False
+        elif re.match(javac_error, line):
+            flag = True
+            match = re.match(javac_error, line)
+            line = match.group(1) + match.group(2)
+        else:
+            line = line.strip()
+        
+        if flag:
+            error_lines.append(line)
+
+    return "\n".join(error_lines)
 
 class WorkDir():
     def __init__(self, path):

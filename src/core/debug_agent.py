@@ -1,6 +1,7 @@
 import json
+import pickle
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,16 +12,18 @@ from rich.table import Table
 
 from src.config import BugInfo
 from src.core.memory import Memory
-from src.core.prompt import EXPERIENCE_PROMPT
+from src.core.prompt import EXPERIENCE_PROMPT, SINGLE_EXPERIENCE_PROMPT, STOP_TAG
 from src.core.search_agent import SearchAgent
-from src.core.utils import extract_json_blocks
+from src.core.utils import extract_json_block
 from src.core.verify_agent import VerifyAgent
+from src.interfaces.d4j import get_test_case_dataset_path, get_test_case_output_path
 from src.repograph.graph_searcher import RepoSearcher
 from src.schema import (
     DebugInput,
     RoundResult,
     SearchInput,
     SearchResult,
+    TestFailure,
     VerifyInput,
     VerifyResult,
 )
@@ -32,6 +35,7 @@ class DebugState:
     bug_name: str
     input: DebugInput
     round_results: List[RoundResult] = field(default_factory=list)
+    parallel_search: bool = False
     completed: bool = False
     current_round: int = 1
     max_rounds: int = 3
@@ -51,21 +55,50 @@ class DebugState:
         self.current_round += 1
         if self.current_round > self.max_rounds:
             self.completed = True
+        
+        if self.parallel_search:
+            # TODO: this may need to be implemented in the future
+            pass
+        else:
+            # early stop if the latest verify round has a buggy method
+            latest_verify_result = self.current_round_result.verify_results[0]
+            if latest_verify_result.category == "buggy":
+                self.completed = True
     
     def get_experience(self) -> Optional[str]:
-        """Generate experience report based on the previous round of VerifyResults"""
+        """Generate an experience report based on the previous round of VerifyResults"""
         if self.current_round == 1:
             return ""
         
         prev_verify_results = self.round_results[self.current_round - 2].verify_results
-        result_strings = []
+        benign_methods = []
+        uncertain_methods = []
         for result in prev_verify_results:
-            if not result.is_buggy:
-                result_strings.append(f"Method {result.method_id} is not buggy. {result.explanation}")
-        return EXPERIENCE_PROMPT.format("\n\n".join(result_strings))
+            if result.category == "benign":
+                benign_methods.append(
+                    SINGLE_EXPERIENCE_PROMPT.format(
+                        method_id=result.method_id,
+                        explanation=result.explanation,
+                        suggestion=result.suggestion
+                    )
+                )
+            elif result.category == "uncertain":
+                uncertain_methods.append(
+                    SINGLE_EXPERIENCE_PROMPT.format(
+                        method_id=result.method_id,
+                        explanation=result.explanation,
+                        suggestion=result.suggestion
+                    )
+                )
+            else:  # skip the methods that have been verified as 'buggy'
+                pass
+        return EXPERIENCE_PROMPT.format(
+            benign_methods="\n\n".join(benign_methods),
+            uncertain_methods="\n\n".join(uncertain_methods)
+        )
     
     def build_search_results(self, results: List[Dict[str, Any]]) -> List[SearchResult]:
-        """Build search results from the JSON results"""
+        """Build search results from the JSON results, we combine the explainations for the same method"""
         res_dict = {}
         for res in results:
             method_id = res["suspicious_method"]
@@ -96,12 +129,16 @@ class DebugState:
         results_info = []
         llm_responses = [m.get_messages()[-1]['content'] for m in memories]
         for response in llm_responses:
-            matches = extract_json_blocks(response)
-            if matches:
-                res = json.loads(matches[0])
+            match = extract_json_block(response)
+            if match:
+                res = json.loads(match)
                 results_info.append(res)
             else:
-                raise ValueError(f"Could not parse JSON response in LLM response: {response}")
+                if STOP_TAG in response:
+                    # the LLM may early stop, so we ignore the error
+                    pass
+                else:
+                    raise ValueError(f"Could not parse JSON response in LLM response: {response}")
         
         memories_infos = [m.serialize() for m in memories]
         result_dict = {
@@ -121,8 +158,9 @@ class DebugState:
             verify_results.append(
                 VerifyResult(
                     method_id=res["method_id"],
-                    is_buggy=res["is_buggy"],
-                    explanation=res["explanation"]
+                    category=res["category"],
+                    explanation=res["explanation"],
+                    suggestion=res["suggestion"]
                 )
             )
         return verify_results
@@ -145,9 +183,9 @@ class DebugState:
         results_info = []
         for i, verify_input in enumerate(verify_inputs):
             response = llm_responses[i]
-            matches = extract_json_blocks(response)
-            if matches:
-                res = json.loads(matches[0])
+            match = extract_json_block(response)
+            if match:
+                res = json.loads(match)
                 res.update({'method_id': verify_input.method_id})
                 results_info.append(res)
             else:
@@ -225,27 +263,25 @@ class DebugState:
 def debug_process(
     bug_info: BugInfo,
     debug_state: DebugState,
-    model_name: str,
     max_workers: int,
-    debug_type: str,
-    llm_args: Dict[str, Any]
+    debug_type: str
 ):
     """Debug process for a single test case"""
     thread_debug = True if debug_type == "single" else False
-    searcher = RepoSearcher(debug_state.input.test_graph)
+    searcher = RepoSearcher(
+        debug_state.input.repo_graph,
+        debug_state.input.loaded_classes
+    )
     search_agent = SearchAgent(
-        model_name=model_name,
+        bug_info=bug_info,
         searcher=searcher,
         max_workers=max_workers,
-        debug=thread_debug,
-        llm_args=llm_args
+        debug=thread_debug
     )
     verify_agent = VerifyAgent(
         bug_info=bug_info,
-        model_name=model_name,
         max_workers=max_workers,
-        debug=thread_debug,
-        llm_args=llm_args
+        debug=thread_debug
     )
     
     while not debug_state.completed:
@@ -298,22 +334,16 @@ class DebugAgent:
     def __init__(
         self,
         bug_info: BugInfo,
-        model_name: str,
         max_workers: int = 5,
-        num_process: int = 3,
-        debug_type: str = "multiple", # "multiple" for multiple test cases, "single" for single test case
-        llm_args: Dict[str, Any] = {}
+        num_process: int = 3
     ):
         self.bug_info = bug_info
-        self.model_name = model_name
         self.max_workers = max_workers
-        self.debug_type = debug_type
-        self.llm_args = llm_args
         self.debug_states: Dict[int, DebugState] = {}
         self.num_process = num_process
         
-        assert self.debug_type in ["multiple", "single"]
-        assert not (self.debug_type == "single" and num_process > 1)
+        # "multiple" for multiple test cases, "single" for single test case
+        self.debug_type = "single" if num_process == 1 else "multiple"
 
     def get_display_table(self) -> Table:
         """Get a table for displaying the debug states"""
@@ -341,10 +371,8 @@ class DebugAgent:
                     args=(
                         self.bug_info,
                         debug_state,
-                        self.model_name,
                         self.max_workers,
-                        self.debug_type,
-                        self.llm_args
+                        self.debug_type
                     )
                 )
                 async_results.append(result)
@@ -365,37 +393,77 @@ class DebugAgent:
     def run_singleprocess(self) -> List[DebugState]:
         results = []
         for _, debug_state in self.debug_states.items():
-            result =debug_process(
+            result = debug_process(
                 self.bug_info,
                 debug_state,
-                self.model_name,
                 self.max_workers,
-                self.debug_type,
-                self.llm_args
+                self.debug_type
             )
             results.append(result)
         return results
 
-    def run(self, inputs: List[DebugInput]) -> List[Dict[str, Any]]:
+    def prepare_debug_inputs(self, test_failure: TestFailure) -> List[DebugInput]:
+        debug_inputs = []
+        test_cases = []
+        for test_class in test_failure.test_classes:
+            test_cases.append(test_class.test_cases)
+        
+        # Limit the number of test cases
+        # We try to keep test cases from different test classes
+        num_test_cases = sum(len(cs) for cs in test_cases)
+        new_test_cases = []
+        max_test_cases = self.bug_info.config.hyper.max_test_cases
+        if num_test_cases > max_test_cases:
+            while True:
+                for cs in test_cases:
+                    new_test_cases.append(cs.pop())
+                    if len(new_test_cases) == max_test_cases:
+                        break
+        else:
+            new_test_cases = [tc for cs in test_cases for tc in cs]
+
+        for test_case in new_test_cases:
+            dataset_path = get_test_case_dataset_path(self.bug_info, test_case)
+            repo_graph_file = dataset_path / "repograph.pkl"
+            with repo_graph_file.open("rb") as f:
+                repo_graph = pickle.load(f)
+            loaded_classes_file = dataset_path / "loaded_classes.txt"
+            loaded_classes = loaded_classes_file.read_text().split("\n")
+            
+            stack_trace_file = dataset_path / "stack_trace.txt"
+            test_output_file = dataset_path / "test_output.txt"
+            test_name = test_case.name
+            test_code = test_case.test_method.text
+            error_message = stack_trace_file.read_text() + "\n\n" + test_output_file.read_text()
+            output_path = get_test_case_output_path(self.bug_info, test_case)
+            
+            debug_inputs.append(
+                DebugInput(
+                    test_name=test_name,
+                    test_code=test_code,
+                    error_message=error_message,
+                    repo_graph=repo_graph,
+                    loaded_classes=loaded_classes,
+                    output_path=output_path
+                )
+            )
+    
+    
+    def run(self, test_failure: TestFailure) -> List[Dict[str, Any]]:
+        # Prepare the debug inputs
+        inputs = self.prepare_debug_inputs(test_failure)
+        
         # Create debug states
         for i, debug_input in enumerate(inputs):
-            debug_state = DebugState(bug_name=self.bug_info.bug_name, input=debug_input)
+            debug_state = DebugState(
+                bug_name=self.bug_info.bug_name,
+                input=debug_input,
+                max_rounds=self.bug_info.config.hyper.debug_rounds,
+                parallel_search=self.bug_info.config.hyper.parallel_search
+            )
             self.debug_states[i] = debug_state
         
         if self.num_process > 1:
             self.run_multiprocess()
         else:
             self.run_singleprocess()
-
-
-if __name__ == "__main__":
-    agent = DebugAgent("gpt-4", None)  # 替换为实际的 RepoSearcher 实例
-    inputs = [
-        {
-            "test_name": "test1",
-            "test_code": "...",
-            "error_message": "...",
-        }
-    ]
-    results = agent.run(inputs)
-    print(results)

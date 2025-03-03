@@ -12,12 +12,16 @@ from openai.types.chat.chat_completion_message_tool_call import Function
 from rich.live import Live
 from rich.table import Table
 
+from src.config import BugInfo
 from src.core.llm_backend import LLMBackend
 from src.core.memory import Memory
 from src.core.prompt import (
-    SEARCH_AGENT_SYSTEM_PROMPT,
+    SEARCH_AGENT_DEBUGGING_PROMPT_MULTIPLE,
+    SEARCH_AGENT_DEBUGGING_PROMPT_SINGLE,
+    SEARCH_AGENT_RESULT_PROMPT,
     SEARCH_AGENT_TOOLS,
     SEARCH_AGENT_USER_PROMPT,
+    STOP_TAG,
 )
 from src.repograph.graph_searcher import RepoSearcher
 from src.schema import SearchInput
@@ -36,6 +40,9 @@ class ProcessState:
             "get_covered_classes": "class",
             "get_covered_methods_of_class": "method",
             "get_method_code": "code",
+            "search_methods_contain_string": "search",
+            "get_callee_methods": "callee",
+            "get_caller_methods": "caller",
         }
         return "->".join([abbreviate_dict[fc] for fc in self.function_calls])
 
@@ -80,15 +87,13 @@ class ThreadStatusMonitor:
 class SearchAgent:
     def __init__(
         self,
-        model_name: str,
+        bug_info: BugInfo,
         searcher: RepoSearcher,
         max_workers: int = 5,
-        debug: bool = False,
-        llm_args: Dict[str, Any] = {}
+        debug: bool = False
     ):
-        self.model_name = model_name
+        self.bug_info = bug_info
         self.debug = debug
-        self.llm_args = llm_args
         self.processes: Dict[int, ProcessState] = {}
         self.process_counter = 0
         self.process_lock = threading.Lock()
@@ -97,10 +102,18 @@ class SearchAgent:
         self.futures = []
         self.searcher = searcher
         
+        self.parallel_search = bug_info.config.hyper.parallel_search
+        if self.parallel_search:
+            self.debug_prompt = SEARCH_AGENT_DEBUGGING_PROMPT_MULTIPLE
+        else:
+            self.debug_prompt = SEARCH_AGENT_DEBUGGING_PROMPT_SINGLE
         self.functions = {
             "get_covered_classes": self.searcher.get_covered_classes,
             "get_covered_methods_of_class": self.searcher.get_covered_methods_of_class,
             "get_method_code": self.searcher.get_method_code,
+            "search_methods_contain_string": self.searcher.search_methods_contain_string,
+            "get_callee_methods": self.searcher.get_callee_methods,
+            "get_caller_methods": self.searcher.get_caller_methods,
         }
 
     def create_process(self, parent_id=None) -> int:
@@ -109,15 +122,24 @@ class SearchAgent:
             if parent_id is not None:
                 parent_process = self.processes[parent_id]
                 self.processes[process_id] = ProcessState(
-                    llm=LLMBackend(),
+                    llm=LLMBackend(
+                        api_key=self.bug_info.config.search_model.api_key,
+                        base_url=self.bug_info.config.search_model.base_url
+                    ),
                     memory=copy.deepcopy(parent_process.memory),
                     id=f"{parent_process.id}-{process_id}",
                     function_calls=copy.deepcopy(parent_process.function_calls)
                 )
             else:
                 self.processes[process_id] = ProcessState(
-                    llm=LLMBackend(),
-                    memory=Memory(SEARCH_AGENT_SYSTEM_PROMPT, self.model_name),
+                    llm=LLMBackend(
+                        api_key=self.bug_info.config.search_model.api_key,
+                        base_url=self.bug_info.config.search_model.base_url
+                    ),
+                    memory=Memory(
+                        self.debug_prompt,
+                        self.bug_info.config.search_model.model
+                    ),
                     id=str(process_id)
                 )
             self.process_counter += 1
@@ -200,23 +222,41 @@ class SearchAgent:
             )
             process.function_calls.append(tool_call.function.name)
         
-        monitor.update_status(process.id, "Running", process.function_call_trace)
+        monitor.update_status(process.id, "Searching", process.function_call_trace)
         
         response = process.llm.call(
             messages=process.memory.get_messages(),
             tools=SEARCH_AGENT_TOOLS,
-            model=self.model_name,
-            parallel_tool_calls=True,
-            **self.llm_args
+            model=self.bug_info.config.search_model.model,
+            parallel_tool_calls=self.parallel_search,
+            **self.bug_info.config.search_model.llm_args.asdict()
         )
         
         message: ChatCompletionMessage = response.choices[0].message
         if message.tool_calls:
             self.process_function_calls(process_id, monitor, message)
         else:
+            # get the debug report
             llm_message = {'role': 'assistant', 'content': message.content}
-            self.processes[process_id].memory.add_message(llm_message)
-            monitor.update_status(process.id, "Completed", process.function_call_trace)
+            process.memory.add_message(llm_message)
+            
+            # check if the LLM wants to stop debugging
+            if STOP_TAG in message.content:
+                monitor.update_status(process.id, "Early Stop", process.function_call_trace)
+                return
+            
+            # get the final result
+            monitor.update_status(process.id, "Summarizing", process.function_call_trace)
+            summary_message = {'role': 'user', 'content': SEARCH_AGENT_RESULT_PROMPT}
+            process.memory.add_message(summary_message)
+            response = process.llm.call(
+                messages=process.memory.get_messages(),
+                model=self.bug_info.config.search_model.model,
+                **self.bug_info.config.search_model.llm_args.asdict()
+            )
+            final_message = {"role": "assistant", "content": response.choices[0].message.content}
+            process.memory.add_message(final_message)
+            monitor.update_status(process.id, "Finished", process.function_call_trace)
     
     def init_memory(self, input: SearchInput, process_id: int) -> None:
         process = self.processes[process_id]

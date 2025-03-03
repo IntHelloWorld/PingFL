@@ -49,6 +49,9 @@ class Config:
                 value = Config(value)
             setattr(self, key, value)
 
+    def asdict(self):
+        return {k: v.asdict() if isinstance(v, Config) else v for k, v in self.__dict__.items()}
+
 
 class BugInfo():
     def __init__(self, args):

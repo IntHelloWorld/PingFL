@@ -1,0 +1,19 @@
+dependencies:
+  java_agent_lib: /home/qyh/projects/FixFL/MethodCallGraphBuilder/target/MethodCallGraphBuilder-1.0.jar
+  bug_exec: /home/qyh/DATASET/defects4j-2.0.1/framework/bin/defects4j
+search_model:
+  series: openai
+  model: gpt-4o-2024-11-20
+  api_key: sk-wVeNxRanT4a3VjE4stpjNH17R6aWkPPRmSaLhzlqYMxVy2ve
+  base_url: https://api.kksj.org/v1
+  llm_args:
+    temperature: 0.7
+verify_model:
+  series: openai
+  model: claude-3-5-sonnet-20241022
+  api_key: sk-uQamS62duqifNKgenOpVgCrT7LMsRzoJ30mxiFkTPWQw1Luk
+  base_url: https://api.kksj.org/v1
+  llm_args:
+    temperature: 0.7
+hyper:
+  debug_rounds: 3

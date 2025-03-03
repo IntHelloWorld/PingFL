@@ -1,600 +1,466 @@
-# This file is adapted from the following sources:
-# RepoMap: https://github.com/paul-gauthier/aider/blob/main/aider/repomap.py
-# Agentless: https://github.com/OpenAutoCoder/Agentless/blob/main/get_repo_structure/get_repo_structure.py
-# grep-ast: https://github.com/paul-gauthier/grep-ast
-
-import ast
-import builtins
-import colorsys
-import inspect
-import json
 import os
 import pickle
-import random
 import re
-import sys
-import warnings
-from collections import Counter, defaultdict, namedtuple
-from copy import deepcopy
+from collections import defaultdict
 from pathlib import Path
+from typing import List, Optional
 
+import chardet
 import networkx as nx
-from grep_ast import TreeContext, filename_to_lang
-from pygments.lexers import guess_lexer_for_filename
-from pygments.token import Token
-from pygments.util import ClassNotFound
 from tqdm import tqdm
-from utils import create_structure
-
-# tree_sitter is throwing a FutureWarning
-warnings.simplefilter("ignore", category=FutureWarning)
-import argparse
-
 from tree_sitter_languages import get_language, get_parser
 
-Tag = namedtuple("Tag", "rel_fname fname line name kind category info".split())
+from src.config import BugInfo
+from src.interfaces.d4j import get_test_case_dataset_path
+from src.schema import CGMethodNode, Tag, TestFailure
+from src.utils import Timer
 
 
 class CodeGraph:
+    """Constructs and manages code dependency graphs for Python/Java projects"""
+    
+    SUPPORTED_LANGS = {
+        '.py': 'python',
+        '.java': 'java'
+    }
+    
+    def __init__(self, src_dir: str, test_dir: str, language: str = None, logger=None):
+        self.src_dir = src_dir
+        self.test_dir = test_dir
+        self.language = language
+        self.logger = logger
+        if language and language not in self.SUPPORTED_LANGS.values():
+            raise ValueError(f"Unsupported language: {language}. Supported languages are: {list(self.SUPPORTED_LANGS.values())}")
+        
+        # Cache for tag locations
+        self.location = {}
+        
+        # Cache for def tags
+        self.def_tags = {}
 
-    warned_files = set()
-
-    def __init__(
+    def get_code_graph(
         self,
-        map_tokens=1024,
-        root=None,
-        main_model=None,
-        io=None,
-        repo_content_prefix=None,
-        verbose=False,
-        max_context_window=None,
+        src_files: List[str],
+        test_files: List[str],
+        inst_graph_file: Path
+    ) -> nx.MultiDiGraph:
+        """Construct code graph from given files"""
+        if not src_files or not test_files:
+            raise ValueError("No source or test files found")
+            
+        src_tags = self.get_file_tags(src_files, False)
+        test_tags = self.get_file_tags(test_files, True)
+        tags = src_tags + test_tags
+        inst_graph = self.load_inst_graph(inst_graph_file)
+        repo_graph = self.create_repo_graph(inst_graph, tags)
+        return repo_graph
+    
+    def load_inst_graph(self, graphml_file: Path) -> nx.DiGraph:
+        """
+        load the call graph from graphml file.
+        Note that a node in this graph is a CGMethodNode object,
+        which may not correspond to a method in the source code.
+        """
+        def get_node_from_str(node_str):
+            pattern = r"(.*?)@(.*?):(.*?)\((\d+)-(\d+)\)"
+            match = re.match(pattern, node_str)
+            if not match:
+                raise ValueError(f"Error: Invalid node string: {node_str}")
+            package, class_name, method_name, start_line, end_line = match.groups()
+            return CGMethodNode(package, class_name, method_name, int(start_line), int(end_line))
+
+        new_G = nx.DiGraph()
+        raw_G = nx.read_gml(graphml_file)
+        for u, v in raw_G.edges:
+            new_G.add_edge(get_node_from_str(u), get_node_from_str(v))
+        return new_G
+    
+    def create_dynamic_graph(
+        self,
+        repo_graph: nx.MultiDiGraph,
+        inst_graph: nx.DiGraph,
+        tags: List[Tag]
     ):
-        self.io = io
-        self.verbose = verbose
-
-        if not root:
-            root = os.getcwd()
-        self.root = root
-
-        self.max_map_tokens = map_tokens
-        self.max_context_window = max_context_window
-
-        # self.token_count = main_model.token_count
-        self.repo_content_prefix = repo_content_prefix
-        self.structure = create_structure(self.root)
-
-    def get_code_graph(self, other_files, mentioned_fnames=None):
-        if self.max_map_tokens <= 0:
-            return
-        if not other_files:
-            return
-        if not mentioned_fnames:
-            mentioned_fnames = set()
-
-        max_map_tokens = self.max_map_tokens
-
-        # With no files in the chat, give a bigger view of the entire repo
-        MUL = 16
-        padding = 4096
-        if max_map_tokens and self.max_context_window:
-            target = min(max_map_tokens * MUL, self.max_context_window - padding)
-        else:
-            target = 0
-
-        tags = self.get_tag_files(other_files, mentioned_fnames)
-        code_graph = self.tag_to_graph(tags)
-
-        return tags, code_graph
-
-    def get_tag_files(self, other_files, mentioned_fnames=None):
-        try:
-            tags = self.get_ranked_tags(other_files, mentioned_fnames)
-            return tags
-        except RecursionError:
-            self.io.tool_error("Disabling code graph, git repo too large?")
-            self.max_map_tokens = 0
-            return
-
-    def tag_to_graph(self, tags):
-        
-        G = nx.MultiDiGraph()
-        for tag in tags:
-            G.add_node(tag['name'], category=tag['category'], info=tag['info'], fname=tag['fname'], line=tag['line'], kind=tag['kind'])
-
-        for tag in tags:
-            if tag['category'] == 'class':
-                class_funcs = tag['info'].split('\t')
-                for f in class_funcs:
-                    G.add_edge(tag['name'], f.strip())
-
-        tags_ref = [tag for tag in tags if tag['kind'] == 'ref']
-        tags_def = [tag for tag in tags if tag['kind'] == 'def']
-        for tag in tags_ref:
-            for tag_def in tags_def:
-                if tag['name'] == tag_def['name']:
-                    G.add_edge(tag['name'], tag_def['name'])
-        return G
-
-    def get_rel_fname(self, fname):
-        return os.path.relpath(fname, self.root)
-
-    def split_path(self, path):
-        path = os.path.relpath(path, self.root)
-        return [path + ":"]
-
-    def get_mtime(self, fname):
-        try:
-            return os.path.getmtime(fname)
-        except FileNotFoundError:
-            self.io.tool_error(f"File not found error: {fname}")
-
-    def get_class_functions(self, tree, class_name):
-        class_functions = []
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
-                        class_functions.append(item.name)
-
-        return class_functions
-
-    def get_func_block(self, first_line, code_block):
-        first_line_escaped = re.escape(first_line)
-        pattern = re.compile(rf'({first_line_escaped}.*?)(?=(^\S|\Z))', re.DOTALL | re.MULTILINE)
-        match = pattern.search(code_block)
-
-        return match.group(0) if match else None
-
-    def std_proj_funcs(self, code, fname):
         """
-        write a function to analyze the *import* part of a py file.
-        Input: code for fname
-        output: [standard functions]
-        please note that the project_dependent libraries should have specific project names.
+        Renew the repo graph with the dynamic call graph.
+        The dynamic call graph is constructed by runtime method call relationship,
+        which is collected by a Java agent.
         """
-        std_libs = []
-        std_funcs = []
-        tree = ast.parse(code)
-        codelines = code.split('\n')
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                # identify the import statement
-                import_statement = codelines[node.lineno-1]
-                for alias in node.names:
-                    import_name = alias.name.split('.')[0]
-                    if import_name in fname:
-                        continue
-                    else:
-                        # execute the import statement to find callable functions
-                        import_statement = import_statement.strip()
-                        try:
-                            exec(import_statement)
-                        except:
-                            continue
-                        std_libs.append(alias.name)
-                        eval_name = alias.name if alias.asname is None else alias.asname
-                        std_funcs.extend([name for name, member in inspect.getmembers(eval(eval_name)) if callable(member)])
-
-            if isinstance(node, ast.ImportFrom):
-                # execute the import statement
-                import_statement = codelines[node.lineno-1]
-                if node.module is None:
-                    continue
-                module_name = node.module.split('.')[0]
-                if module_name in fname:
-                    continue
-                else:
-                    # handle imports with parentheses
-                    if "(" in import_statement:
-                        for ln in range(node.lineno-1, len(codelines)):
-                            if ")" in codelines[ln]:
-                                code_num = ln
-                                break
-                        import_statement = '\n'.join(codelines[node.lineno-1:code_num+1])
-                    import_statement = import_statement.strip()
-                    try:
-                        exec(import_statement)
-                    except:
-                        continue
-                    for alias in node.names:
-                        std_libs.append(alias.name)
-                        eval_name = alias.name if alias.asname is None else alias.asname
-                        if eval_name == "*":
-                            continue
-                        std_funcs.extend([name for name, member in inspect.getmembers(eval(eval_name)) if callable(member)])
-        return std_funcs, std_libs
-                    
-
-    def get_tags(self, fname, rel_fname):
-        # Check if the file is in the cache and if the modification time has not changed
-        file_mtime = self.get_mtime(fname)
-        if file_mtime is None:
-            return []
-        # miss!
-        data = list(self.get_tags_raw(fname, rel_fname))
-        return data
-
-    def get_tags_raw(self, fname, rel_fname):
-        ref_fname_lst = rel_fname.split('/')
-        s = deepcopy(self.structure)
-        for fname_part in ref_fname_lst:
-            s = s[fname_part]
-        structure_classes = {item['name']: item for item in s['classes']}
-        structure_functions = {item['name']: item for item in s['functions']}
-        structure_class_methods = dict()
-        for cls in s['classes']:
-            for item in cls['methods']:
-                structure_class_methods[item['name']] = item
-        structure_all_funcs = {**structure_functions, **structure_class_methods}
-
-        lang = filename_to_lang(fname)
-        if not lang:
-            return
-        language = get_language(lang)
-        parser = get_parser(lang)
-
-        # Load the tags queries
-        try:
-            # scm_fname = resources.files(__package__).joinpath(
-            #     "/shared/data3/siruo2/SWE-agent/sweagent/environment/queries", f"tree-sitter-{lang}-tags.scm")
-            scm_fname = """
-            (class_definition
-            name: (identifier) @name.definition.class) @definition.class
-
-            (function_definition
-            name: (identifier) @name.definition.function) @definition.function
-
-            (call
-            function: [
-                (identifier) @name.reference.call
-                (attribute
-                    attribute: (identifier) @name.reference.call)
-            ]) @reference.call
-            """
-        except KeyError:
-            return
-        query_scm = scm_fname
-        # if not query_scm.exists():
-        #     return
-        # query_scm = query_scm.read_text()
-
-        with open(str(fname), "r", encoding='utf-8') as f:
-            code = f.read()
-        with open(str(fname), "r", encoding='utf-8') as f:    
-            codelines = f.readlines()
-
-        # hard-coded edge cases
-        code = code.replace('\ufeff', '')
-        code = code.replace('constants.False', '_False')
-        code = code.replace('constants.True', '_True')
-        code = code.replace("False", "_False")
-        code = code.replace("True", "_True")
-        code = code.replace("DOMAIN\\username", "DOMAIN\\\\username")
-        code = code.replace("Error, ", "Error as ")
-        code = code.replace('Exception, ', 'Exception as ')
-        code = code.replace("print ", "yield ")
-        pattern = r'except\s+\(([^,]+)\s+as\s+([^)]+)\):'
-        # Replace 'as' with ','
-        code = re.sub(pattern, r'except (\1, \2):', code)
-        code = code.replace("raise AttributeError as aname", "raise AttributeError")
-
-        # code = self.io.read_text(fname)
-        if not code:
-            return
-        tree = parser.parse(bytes(code, "utf-8"))
-        try:
-            tree_ast = ast.parse(code)
-        except:
-            tree_ast = None
-
-        # functions from third-party libs or default libs
-        try:
-            std_funcs, std_libs = self.std_proj_funcs(code, fname)
-        except:
-            std_funcs, std_libs = [], []
-        
-        # functions from builtins
-        builtins_funs = [name for name in dir(builtins)]
-        builtins_funs += dir(list)
-        builtins_funs += dir(dict)
-        builtins_funs += dir(set)  
-        builtins_funs += dir(str)
-        builtins_funs += dir(tuple)
-
-        # Run the tags queries
-        query = language.query(query_scm)
-        captures = query.captures(tree.root_node)
-        captures = list(captures)
-
-        saw = set()
-        for node, tag in captures:
-            if tag.startswith("name.definition."):
-                kind = "def"
-            elif tag.startswith("name.reference."):
-                kind = "ref"
-            else:
-                continue
-
-            saw.add(kind)
-            cur_cdl = codelines[node.start_point[0]]
-            category = 'class' if 'class ' in cur_cdl else 'function'
-            tag_name = node.text.decode("utf-8")
+        def match_tag(node: CGMethodNode):
+            if node in node_to_tag:
+                return node_to_tag[node]
             
-            #  we only want to consider project-dependent functions
-            if tag_name in std_funcs:
-                continue
-            elif tag_name in std_libs:
-                continue
-            elif tag_name in builtins_funs:
-                continue
+            founded_tags = []
+            if "$" in node.class_name: # may be a inner class
+                last_idx = node.class_name.rfind("$")
+                while last_idx != -1:
+                    query_key = f"{node.class_name[:last_idx]}.{node.method_name}"
+                    if query_key in tag_map:
+                        for start_line, end_line in tag_map[query_key]:
+                            if node.start_line >= start_line and node.end_line <= end_line:
+                                founded_tags.append(tag_map[query_key][(start_line, end_line)])
+                    last_idx = node.class_name.rfind("$", 0, last_idx)
+            else:
+                query_key = f"{node.class_name}.{node.method_name}"
+                if query_key in tag_map:
+                    for start_line, end_line in tag_map[query_key]:
+                        if node.start_line >= start_line and node.end_line <= end_line:
+                            founded_tags.append(tag_map[query_key][(start_line, end_line)])
 
-            if category == 'class':
-                # try:
-                #     class_functions = self.get_class_functions(tree_ast, tag_name)
-                # except:
-                #     class_functions = "None"
-                class_functions = [item['name'] for item in structure_classes[tag_name]['methods']]
-                if kind == 'def':
-                    line_nums = [structure_classes[tag_name]['start_line'], structure_classes[tag_name]['end_line']]
-                else:
-                    line_nums = [node.start_point[0], node.end_point[0]]
-                result = Tag(
-                    rel_fname=rel_fname,
-                    fname=fname,
-                    name=tag_name,
-                    kind=kind,
-                    category=category,
-                    info='\n'.join(class_functions), # list unhashable, use string instead
-                    line=line_nums,
-                )
-
-            elif category == 'function':
-
-                if kind == 'def':
-                    # func_block = self.get_func_block(cur_cdl, code)
-                    # cur_cdl =func_block
-                    cur_cdl = '\n'.join(structure_all_funcs[tag_name]['text'])
-                    line_nums = [structure_all_funcs[tag_name]['start_line'], structure_all_funcs[tag_name]['end_line']]
-                else:
-                    line_nums = [node.start_point[0], node.end_point[0]]
-
-                result = Tag(
-                    rel_fname=rel_fname,
-                    fname=fname,
-                    name=tag_name,
-                    kind=kind,
-                    category=category,
-                    info=cur_cdl,
-                    line=line_nums,
-                )
-
-            yield result
-
-        if "ref" in saw:
-            return
-        if "def" not in saw:
-            return
-
-        # We saw defs, without any refs
-        # Some tags files only provide defs (cpp, for example)
-        # Use pygments to backfill refs
-
-        try:
-            lexer = guess_lexer_for_filename(fname, code)
-        except ClassNotFound:
-            return
-
-        tokens = list(lexer.get_tokens(code))
-        tokens = [token[1] for token in tokens if token[0] in Token.Name]
-
-        for token in tokens:
-            yield Tag(
-                rel_fname=rel_fname,
-                fname=fname,
-                name=token,
-                kind="ref",
-                line=-1,
-                category='function',
-                info='none',
-            )
-
-    def get_ranked_tags(self, other_fnames, mentioned_fnames):
-        # defines = defaultdict(set)
-        # references = defaultdict(list)
-        # definitions = defaultdict(set)
+            if not founded_tags:
+                return None
+            elif len(founded_tags) == 1:
+                founded_tag = founded_tags[0]
+                node_to_tag[node] = founded_tag
+                founded_tag.outer_class = node.outer_class
+                founded_tag.inner_class = node.inner_class
+                founded_tag.is_covered = True
+                return founded_tag
+            else:
+                # if multiple tags are found, choose the smallest one
+                sorted_tags = sorted(founded_tags, key=lambda x: x.line[1] - x.line[0])
+                founded_tag = sorted_tags[0]
+                node_to_tag[node] = founded_tag
+                founded_tag.outer_class = node.outer_class
+                founded_tag.inner_class = node.inner_class
+                founded_tag.is_covered = True
+                return founded_tag
         
-        tags_of_files = list()
+        # group the tags for matching
+        tag_map = defaultdict(dict)
+        for tag in tags:
+            if tag.category == 'function':
+                file_path = Path(tag.fname)
+                outer_class = file_path.stem
+                method_name = tag.name
+                query_key = f"{outer_class}.{method_name}"
+                tag_map[query_key][tag.line] = tag
+        
+        node_to_tag = {}
+        for u, v in tqdm(inst_graph.edges, desc="Adding dynamic call edges"):
+            tag_u = match_tag(u)
+            tag_v = match_tag(v)
+            if tag_u and tag_v:
+                repo_graph.add_edge(tag_u, tag_v, rel='calls')
+    
+    def create_static_graph(self, repo_graph: nx.MultiDiGraph, tags: List[Tag]):
+        """
+        Renew the repo graph with the static call graph.
+        The static call graph is constructed by the code dependency relationship,
+        which is collected by the tree-sitter parser. 
+        
+        Note: The static analysis may not be accurate!
+        """
+        
+        def find_def_tag(ref_tag, categories=[]):
+            """Find definition tag for reference"""
+            ref_fname = ref_tag.fname
+            ref_line = ref_tag.line
+            if ref_fname not in self.location:
+                return None
+            for lines, def_tag in self.location[ref_fname].items():
+                if lines[0] <= ref_line[0] and ref_line[1] <= lines[1]:
+                    if categories and def_tag.category not in categories:
+                        continue
+                    return def_tag
+            return None
+        
+        
+        # Add edges for references
+        tags_ref = [tag for tag in tags if tag.kind == 'ref']
+        # tags_def = [tag for tag in tags if tag.kind == 'def']
+        tags_class = [tag for tag in tags if tag.category == 'class']
+        tags_function = [tag for tag in tags if tag.category == 'function']
+        tags_field = [tag for tag in tags if tag.category == 'field']
+        tags_interface = [tag for tag in tags if tag.category == 'interface']
+        
+        # Add nodes
+        repo_graph.add_nodes_from(tags)
+        
+        # Add edges
+        for tag in tqdm(tags_function, desc="Adding function-class edges"):
+            tgt_tag = find_def_tag(tag, ['class', 'interface', 'enum'])
+            if tgt_tag:
+                repo_graph.add_edge(tgt_tag, tag, rel='defines_function')
+            else:
+                if self.language == 'java':
+                    raise ValueError(f"Missing class definition for function {tag.name}")
+        
+        for tag in tqdm(tags_field, desc="Adding field-class edges"):
+            tgt_tag = find_def_tag(tag, ['class', 'interface', 'enum'])
+            if tgt_tag:
+                repo_graph.add_edge(tgt_tag, tag, rel='defines_field')
+            else:
+                if self.language == 'java':
+                    raise ValueError(f"Missing class definition for field {tag.name}")
+        
+        for tag in tqdm(tags_ref, desc="Adding function call edges"):
+            src_tag = find_def_tag(tag, ['function', 'field'])
+            if src_tag:
+                tgt_tags = self.def_tags.get(tag.name, [])
+                for tgt_tag in tgt_tags:
+                    if tgt_tag != src_tag:
+                        repo_graph.add_edge(src_tag, tgt_tag, rel='may_calls')
+        
+        for tag in tqdm(tags_class, desc="Adding inherits and implements edges"):
+            if tag.parent_class:
+                for parent_tag in tags_class:
+                    if parent_tag.name == tag.parent_class:
+                        repo_graph.add_edge(tag, parent_tag, rel='inherits')
+            if tag.interfaces:
+                for interface in tag.interfaces:
+                    for interface_tag in tags_interface:
+                        if interface_tag.name == interface:
+                            repo_graph.add_edge(tag, interface_tag, rel='implements')
+    
+    def create_repo_graph(self, G: nx.DiGraph, tags: List[Tag]) -> nx.MultiDiGraph:
+        """Create repo graph from static and dynamic graphs"""
+        with Timer(self.logger, "Creating repo graph"):
+            repo_graph = nx.MultiDiGraph()
+            self.create_static_graph(repo_graph, tags)
+            self.create_dynamic_graph(repo_graph, G, tags)
+            return repo_graph
 
-        personalization = dict()
-
-        fnames = set(other_fnames)
-        # chat_rel_fnames = set()
-
-        fnames = sorted(fnames)
-
-        # Default personalization for unspecified files is 1/num_nodes
-        # https://networkx.org/documentation/stable/_modules/networkx/algorithms/link_analysis/pagerank_alg.html#pagerank
-        personalize = 10 / len(fnames)
-
-        for fname in tqdm(fnames):
+    def get_file_tags(self, files: List[str], is_test: bool) -> List[Tag]:
+        """Extract tags from source files"""
+        all_tags = []
+        for fname in tqdm(files, desc="Parsing tags"):
             if not Path(fname).is_file():
-                if fname not in self.warned_files:
-                    if Path(fname).exists():
-                        self.io.tool_error(
-                            f"Code graph can't include {fname}, it is not a normal file"
-                        )
-                    else:
-                        self.io.tool_error(f"Code graph can't include {fname}, it no longer exists")
-
-                self.warned_files.add(fname)
                 continue
-
-            # dump(fname)
-            rel_fname = self.get_rel_fname(fname)
-
-            # if fname in chat_fnames:
-            #     personalization[rel_fname] = personalize
-            #     chat_rel_fnames.add(rel_fname)
-
-            if fname in mentioned_fnames:
-                personalization[rel_fname] = personalize
             
-            tags = list(self.get_tags(fname, rel_fname))
-
-            tags_of_files.extend(tags)
-
-            if tags is None:
-                continue
-
-        return tags_of_files
-    
-
-    def render_tree(self, abs_fname, rel_fname, lois):
-        key = (rel_fname, tuple(sorted(lois)))
-
-        if key in self.tree_cache:
-            return self.tree_cache[key]
-
-        # code = self.io.read_text(abs_fname) or ""
-        with open(str(abs_fname), "r", encoding='utf-8') as f:
-            code = f.read() or ""
-
-        if not code.endswith("\n"):
-            code += "\n"
-
-        context = TreeContext(
-            rel_fname,
-            code,
-            color=False,
-            line_number=False,
-            child_context=False,
-            last_line=False,
-            margin=0,
-            mark_lois=False,
-            loi_pad=0,
-            # header_max=30,
-            show_top_of_file_parent_scope=False,
-        )
-
-        context.add_lines_of_interest(lois)
-        context.add_context()
-        res = context.format()
-        self.tree_cache[key] = res
-        return res
-
-    def to_tree(self, tags, chat_rel_fnames):
-        if not tags:
-            return ""
-
-        tags = [tag for tag in tags if tag[0] not in chat_rel_fnames]
-        tags = sorted(tags)
-
-        cur_fname = None
-        cur_abs_fname = None
-        lois = None
-        output = ""
-
-        # add a bogus tag at the end so we trip the this_fname != cur_fname...
-        dummy_tag = (None,)
-        for tag in tags + [dummy_tag]:
-            this_rel_fname = tag[0]
-
-            # ... here ... to output the final real entry in the list
-            if this_rel_fname != cur_fname:
-                if lois is not None:
-                    output += "\n"
-                    output += cur_fname + ":\n"
-                    output += self.render_tree(cur_abs_fname, cur_fname, lois)
-                    lois = None
-                elif cur_fname:
-                    output += "\n" + cur_fname + "\n"
-                if type(tag) is Tag:
-                    lois = []
-                    cur_abs_fname = tag.fname
-                cur_fname = this_rel_fname
-
-            if lois is not None:
-                lois.append(tag.line)
-
-        # truncate long lines, in case we get minified js or something else crazy
-        output = "\n".join([line[:100] for line in output.splitlines()]) + "\n"
-
-        return output
-
-
-    def find_src_files(self, directory):
-        if not os.path.isdir(directory):
-            return [directory]
-
-        src_files = []
-        for root, dirs, files in os.walk(directory):
-            for file in files:
-                src_files.append(os.path.join(root, file))
-        return src_files
-    
-
-    def find_files(self, dir):
-        chat_fnames = []
-
-        for fname in dir:
-            if Path(fname).is_dir():
-                chat_fnames += self.find_src_files(fname)
+            if is_test:
+                rel_fname = os.path.relpath(fname, self.test_dir)
             else:
-                chat_fnames.append(fname)
+                rel_fname = os.path.relpath(fname, self.src_dir)
+            ext = Path(fname).suffix
+            
+            lang = self.SUPPORTED_LANGS[ext]
+            tags = self.parse_file(fname, rel_fname, lang, is_test)
+            all_tags.extend(tags)
+            
+        return all_tags
+
+    def parse_file(self, fname: str, rel_fname: str, lang: str, is_test: bool) -> List[Tag]:
+        """Parse single source file and extract tags"""
+        try:
+            with open(fname, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+        except UnicodeDecodeError:
+            with open(fname, 'rb') as f:
+                file_content = f.read()
+                encoding = chardet.detect(file_content)['encoding']
+                file_content = file_content.decode(encoding)
         
-        chat_fnames_new = []
-        for item in chat_fnames:
-            # filter out non-python files
-            if not item.endswith('.py'):
-                continue
+        parser = get_parser(lang)
+        language = get_language(lang)
+        tree = parser.parse(bytes(file_content, 'utf-8'))
+        
+        # Get language-specific query
+        query = self.get_query(lang)
+        captures = language.query(query).captures(tree.root_node)
+        
+        tags = []
+        for node, tag_type in captures:
+            tag = self.create_tag(node, tag_type, fname, rel_fname, file_content, is_test)
+            if tag:
+                tags.append(tag)
+                
+        return tags
+    
+    def get_node_code(self, node, code: str) -> str:
+        """Get code for AST node, keep the indentation"""
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        return "\n".join(code.splitlines()[start_line-1:end_line])
+
+    def create_tag(self, node, tag_type: str, fname: str, rel_fname: str, file_content: str, is_test: bool) -> Optional[Tag]:
+        """Create tag from AST node"""
+        pkg_name = '.'.join(rel_fname.split('.')[0].split('/')[:-1])
+        parent_class = None
+        outer_class = rel_fname.split('/')[-1].split('.')[0]
+        interfaces = []
+        
+        if tag_type == "definition.interface":
+            kind = "def"
+            name_node = node.child_by_field_name("name")
+            code = self.get_node_code(node, file_content)
+            category = 'interface'
+            if name_node:
+                name = name_node.text.decode("utf-8")
             else:
-                chat_fnames_new.append(item)
+                raise ValueError(f"Missing name node in {tag_type}")
+        elif tag_type == "definition.enum":
+            kind = "def"
+            name_node = node.child_by_field_name("name")
+            code = self.get_node_code(node, file_content)
+            category = 'enum'
+            if name_node:
+                name = name_node.text.decode("utf-8")
+            else:
+                raise ValueError(f"Missing name node in {tag_type}")
+        elif tag_type == "definition.class":
+            kind = "def"
+            name_node = node.child_by_field_name("name")
+            code = self.get_node_code(node, file_content)
+            category = 'class'
+            if name_node:
+                name = name_node.text.decode("utf-8")
+                if self.language == 'python':
+                    bases_node = node.child_by_field_name("bases")
+                    if bases_node and bases_node.named_children:
+                        parent_class = bases_node.named_children[0].text.decode("utf-8")
+                elif self.language == 'java':
+                    superclass_node = node.child_by_field_name("superclass")
+                    if superclass_node and superclass_node.named_children:
+                        parent_class = superclass_node.named_children[0].text.decode("utf-8")
+                    interfaces_node = node.child_by_field_name("interfaces")
+                    if interfaces_node:
+                        interfaces = [child.text.decode("utf-8") for child in interfaces_node.named_children]
+        elif tag_type in ["definition.function", "definition.constructor"]:
+            kind = "def"
+            category = 'function'
+            name_node = node.child_by_field_name("name")
+            code = self.get_node_code(node, file_content)
+            if name_node:
+                name = name_node.text.decode("utf-8")
+            else:
+                raise ValueError(f"Missing name node in {tag_type}")
+        elif tag_type == "definition.class.field":
+            kind = "def"
+            category = 'field'
+            name_node = node.child_by_field_name("declarator").child_by_field_name("name")
+            code = self.get_node_code(node, file_content)
+            if name_node:
+                name = name_node.text.decode("utf-8")
+            else:
+                raise ValueError(f"Missing name node in {tag_type}")
+        elif tag_type.startswith("name.reference."):
+            kind = "ref"
+            name = node.text.decode("utf-8")
+            category = None
+            code = None
+        else:
+            return None
+        
+        lines = (node.start_point[0] + 1, node.end_point[0] + 1)
+        tag = Tag(
+            rel_fname,
+            fname,
+            lines,
+            name,
+            kind,
+            category,
+            code,
+            pkg_name,
+            parent_class,
+            tuple(interfaces),
+            is_test,
+            outer_class
+        )
+        try:
+            self.location[fname][lines] = tag
+        except:
+            self.location[fname] = {lines: tag}
+        
+        if kind == 'def':
+            try:
+                self.def_tags[name].append(tag)
+            except:
+                self.def_tags[name] = [tag]
+        return tag
+
+
+    @staticmethod 
+    def get_query(lang: str) -> str:
+        """Get AST query for specified language"""
+        queries = {
+            'python': """
+                (class_definition 
+                    name: (identifier) @name.definition.class
+                    bases: (argument_list 
+                        (identifier)? @name.inherit.class)?) @definition.class
+                (function_definition name: (identifier) @name.definition.function) @definition.function
+                (class_definition
+                    body: (block 
+                        (expression_statement
+                            (assignment 
+                                left: (identifier) @name.definition.field)))) @definition.class.field
+                (call function: [(identifier) @name.reference.call (attribute attribute: (identifier) @name.reference.call)]) @reference.call
+            """,
+            'java': """
+                (interface_declaration 
+                    name: (identifier) @name.definition.interface) @definition.interface
+                    
+                (class_declaration 
+                    name: (identifier) @name.definition.class) @definition.class
+                
+                (enum_declaration
+                    name: (identifier) @name.definition.enum) @definition.enum
+
+                (method_declaration 
+                    name: (identifier) @name.definition.function) @definition.function
+                    
+                (constructor_declaration 
+                    name: (identifier) @name.definition.constructor) @definition.constructor
+                    
+                (field_declaration 
+                    declarator: (variable_declarator 
+                        name: (identifier) @name.definition.field)) @definition.class.field
+                        
+                (method_invocation 
+                    name: (identifier) @name.reference.call) @reference.call
+                    
+                (object_creation_expression 
+                    type: (type_identifier) @name.reference.constructor) @reference.call
+            """
+        }
+        return queries.get(lang, '')
     
-        return chat_fnames_new
+    def logging(self, message):
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(message)
+
+    def print_graph_infos(self, G: nx.MultiDiGraph):
+        """Print graph statistics"""
+        self.logging("-" * 50)
+        self.logging(f"Generated graph with {len(G.nodes)} nodes and {len(G.edges)} edges")
+        self.logging(f"covered nodes: {len([n for n in G.nodes(data=True) if n[0].is_covered])}")
+        self.logging(f"function-class edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'defines_function'])}")
+        self.logging(f"field-class edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'defines_field'])}")
+        self.logging(f"static call edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'may_calls'])}")
+        self.logging(f"dynamic call edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'calls'])}")
+        self.logging(f"inheritance edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'inherits'])}")
+        self.logging(f"interface implementation edges: {len([e for e in G.edges(data=True) if e[2]['rel'] == 'implements'])}")
+        self.logging("-" * 50)
+
+def create_repo_graph(bug_info: BugInfo, test_failure: TestFailure, language="java"):
+    """Programmatic interface"""
     
-
-def get_random_color():
-    hue = random.random()
-    r, g, b = [int(x * 255) for x in colorsys.hsv_to_rgb(hue, 1, 0.75)]
-    res = f"#{r:02x}{g:02x}{b:02x}"
-    return res
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Construct code graph for a repository directory.")
-    parser.add_argument("dirname", type=str, help="Path to the repository directory.")
-    parser.add_argument("language", type=str, help="Programming language of the repository.")
-    args = parser.parse_args()
-
-    dir_name = args.dirname
-    language = args.language
-
-    code_graph = CodeGraph(root=dir_name)
-    chat_fnames_new = code_graph.find_files([dir_name])
-
-    tags, G = code_graph.get_code_graph(chat_fnames_new)
-
-    print("---------------------------------")
-    print(f"🏅 Successfully constructed the code graph for repo directory {dir_name}")
-    print(f"   Number of nodes: {len(G.nodes)}")
-    print(f"   Number of edges: {len(G.edges)}")
-    print("---------------------------------")
-
-    with open(f'{os.getcwd()}/graph.pkl', 'wb') as f:
-        pickle.dump(G, f)
+    for test_class in test_failure.test_classes:
+        for test_case in test_class.test_cases:
+            bug_info.logger.info(f"[build repo graph] test case: {bug_info.project}-{bug_info.bug_id} {test_case.name}")
     
-    for tag in tags:
-        with open(f'{os.getcwd()}/tags.json', 'a+') as f:
-            line = json.dumps({
-                "fname": tag.fname,
-                'rel_fname': tag.rel_fname,
-                'line': tag.line,
-                'name': tag.name,
-                'kind': tag.kind,
-                'category': tag.category,
-                'info': tag.info,
-            })
-            f.write(line+'\n')
-    print(f"🏅 Successfully cached code graph and node tags in directory ''{os.getcwd()}''")
+            src_dir = bug_info.buggy_path / bug_info.src_prefix
+            test_dir = bug_info.buggy_path / bug_info.test_prefix
+            graph = CodeGraph(src_dir, test_dir, language, bug_info.logger)
+            
+            test_cache_dir = get_test_case_dataset_path(bug_info, test_case)
+            test_cache_dir.mkdir(parents=True, exist_ok=True)
+            repo_graph_file = test_cache_dir / "repograph.pkl"
+            if repo_graph_file.exists():
+                bug_info.logger.info(f"[build repo graph] exist cache {repo_graph_file}")
+                continue
+            
+            ext = [ext for ext, lang in CodeGraph.SUPPORTED_LANGS.items() if lang == language][0]
+            src_files = [str(f) for f in Path(src_dir).rglob(f'*{ext}')]
+            test_files = [str(f) for f in Path(test_dir).rglob(f'*{ext}')]
+            inst_graph_file = test_cache_dir / "callgraph.graphml"
+            
+            G = graph.get_code_graph(src_files, test_files, inst_graph_file)
+            graph.print_graph_infos(G)
+            bug_info.logger.info(f"[build repo graph] OK!")
+            with repo_graph_file.open("wb") as f:
+                pickle.dump(G, f)

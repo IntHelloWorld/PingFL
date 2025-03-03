@@ -1,24 +1,3 @@
 dependencies:
-  java_agent_lib: /home/qyh/projects/FixFL/javaagent/target/javaagent-1.0.jar
+  java_agent_lib: /home/qyh/projects/FixFL/MethodCallGraphBuilder/target/MethodCallGraphBuilder-1.0.jar
   bug_exec: /home/qyh/DATASET/defects4j-2.0.1/framework/bin/defects4j
-model:
-  series: openai
-  model: deepseek-chat
-  api_key: null
-  base_url: https://api.deepseek.com/v1
-  max_tokens: 4000
-  rate_limit: 6000
-  cache_name: deepseek
-hyper:
-  max_diagnose_rounds: 5
-  sbfl_formula: ochiai
-  retrieve_top_n: 50
-  rerank_top_n: 50
-  chat_rerank_top_n: 10
-  max_module_size: 15
-  min_module_size: 5
-use_chat_rerank: true
-use_context: true
-use_context_retrieval: true
-use_description_retrieval: true
-clear: true

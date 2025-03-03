@@ -11,9 +11,17 @@ from typing import Dict, List, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from interfaces.method_extractor import JavaMethodExtractor, JMethod
-from interfaces.utils import WorkDir, auto_read, git_clean, run_cmd
+from interfaces.utils import (
+    WorkDir,
+    auto_read,
+    filter_compile_error,
+    git_clean,
+    run_cmd,
+)
 from src.config import BugInfo
+from src.exceptions import CompileError
 from src.schema import TestCase, TestClass, TestFailure
+from src.utils import Timer
 
 filepath = Path(__file__).parent
 root = filepath.parent
@@ -95,40 +103,22 @@ def run_single_test_playground(bugInfo: BugInfo, playground_path: Path, test_nam
     )
     
     cmd_text = None
-    output_text = "The test output is empty."
-    trace_text = "There are no failing tests."
-    print_text = "The log printed by the edited program is empty."
+    print_text = "empty"
     
     # check if the compilation is successful
     if console_err.splitlines()[0].endswith("FAIL"):
-        cmd_text = console_err
+        cmd_text = filter_compile_error(console_err)
     else:
-        # collect the output and trace
-        test_report_file = playground_path / "failing_tests"
-        if not test_report_file.exists():
-            raise Exception(f"Error: {test_report_file} not exists.")
-        test_report = test_report_file.read_text().splitlines()
-        if test_report: # if there are failing tests
-            output_text, trace_text = parse_test_report(test_report, bugInfo)
-        
         # collect the print text
         print_file = playground_path / "output.txt"
         if print_file.exists():
             print_text = print_file.read_text()
+            print_file.unlink()
     
     if cmd_text:
-        return f"There are errors to compile and run the edited method, please try to re-edit the method.\n\n Error Log:\n{cmd_text}"
+        raise CompileError(cmd_text)
     else:
-        test_class_name, test_method_name = test_name.split("::")
-        dataset_path = bugInfo.bug_path / test_class_name.replace(".", "_") / test_method_name
-        initial_test_output_file = dataset_path / "test_output.txt"
-        initial_stack_trace_file = dataset_path / "stack_trace.txt"
-        initial_test_output = initial_test_output_file.read_text()
-        initial_stack_trace = initial_stack_trace_file.read_text()
-        if initial_test_output != output_text or initial_stack_trace != trace_text:
-            return f"New Test Output:\n{output_text}\n\nNew Stack Trace:\n{trace_text}\n\nPrinted Log:\n{print_text}"
-        else:
-            return f"The test result is the same as before.\n\nPrinted Log:\n{print_text}"
+        return f"The log printed by the edited code is as follows:\n```\n{print_text}\n```"
 
 
 def get_test_case_output_path(bugInfo: BugInfo, test_case: TestCase) -> Path:
@@ -172,7 +162,7 @@ def run_single_test(test_case: TestCase, bugInfo: BugInfo):
         f.writelines(stack_trace)
     return test_output, stack_trace
 
-def run_test_with_instrument(test_case: TestCase, bugInfo: BugInfo):
+def run_test_with_instrument_old(test_case: TestCase, bugInfo: BugInfo):
     test_cache_dir = get_test_case_dataset_path(bugInfo, test_case)
     run_methods_file = test_cache_dir / "run.log"
     test_output_file = test_cache_dir / "test_output.txt"
@@ -201,6 +191,42 @@ def run_test_with_instrument(test_case: TestCase, bugInfo: BugInfo):
         stack_trace_file.write_text("\n".join(stack_trace))
         assert all(f.exists() for f in all_files)
     
+    test_case.test_output = test_output_file.read_text()
+    test_case.stack_trace = stack_trace_file.read_text()
+
+
+def run_test_with_instrument(test_case: TestCase, bugInfo: BugInfo):
+    test_cache_dir = get_test_case_dataset_path(bugInfo, test_case)
+    loaded_classes_file = test_cache_dir / "loaded_classes.txt"
+    calltrace_file = test_cache_dir / "callgraph.graphml"
+    test_output_file = test_cache_dir / "test_output.txt"
+    stack_trace_file = test_cache_dir / "stack_trace.txt"
+    all_files = [loaded_classes_file, calltrace_file, test_output_file, stack_trace_file]
+    src_class_path = bugInfo.buggy_path / bugInfo.src_class_prefix
+    test_class_path = bugInfo.buggy_path / bugInfo.test_class_prefix
+
+    if (all(os.path.exists(f) for f in all_files)):
+        bugInfo.logger.info("instrumentation already done, skip!")
+    else:
+        shutil.rmtree(test_cache_dir, ignore_errors=True)
+        test_cache_dir.mkdir(parents=True, exist_ok=True)
+        git_clean(bugInfo.buggy_path)
+        cmd = f"{bugInfo.bug_exec} test -n "\
+            f"-t {test_case.name} "\
+            f"-a -Djvmargs=-javaagent:{bugInfo.java_agent_lib}="\
+            f"srcClassPath={src_class_path},"\
+            f"testClassPath={test_class_path}"
+        with WorkDir(bugInfo.buggy_path):
+            run_cmd(cmd)
+            shutil.copy(f"{bugInfo.buggy_path}/callgraph.graphml", test_cache_dir)
+            shutil.copy(f"{bugInfo.buggy_path}/loaded_classes.txt", test_cache_dir)
+        test_report_file = bugInfo.buggy_path / "failing_tests"
+        test_report = test_report_file.read_text().splitlines()
+        test_output, stack_trace = parse_test_report(test_report, bugInfo)
+        test_output_file.write_text("\n".join(test_output))
+        stack_trace_file.write_text("\n".join(stack_trace))
+        assert all(f.exists() for f in all_files)
+
     test_case.test_output = test_output_file.read_text()
     test_case.stack_trace = stack_trace_file.read_text()
 
@@ -483,7 +509,8 @@ def run_all_tests(bugInfo: BugInfo, test_failure: TestFailure):
         bugInfo.logger.info(f"[run all tests] test class: {bugInfo.project}-{bugInfo.bug_id} {test_class.name}")
         for test_case in test_class.test_cases:
             bugInfo.logger.info(f"[run all tests]   \u14AA test case: {bugInfo.project}-{bugInfo.bug_id} {test_case.name}")
-            run_test_with_instrument(test_case, bugInfo)
+            with Timer(bugInfo.logger, "instrumentation"):
+                run_test_with_instrument(test_case, bugInfo)
 
 def get_class_name_from_msg(tmp_path, test_class):
     """

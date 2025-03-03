@@ -15,19 +15,25 @@ from src.config import BugInfo
 from src.core.llm_backend import LLMBackend
 from src.core.memory import Memory
 from src.core.prompt import (
-    VERIFY_AGENT_SYSTEM_PROMPT,
-    VERIFY_AGENT_TOOLS,
+    VERIFY_AGENT_DEBUGGING_PROMPT,
+    VERIFY_AGENT_RESULT_PROMPT,
     VERIFY_AGENT_USER_PROMPT,
 )
 from src.core.utils import (
-    extract_json_blocks,
+    ContextMatcher,
+    extract_edit_block,
+    extract_java_block,
+    extract_json_block,
     extract_print_blocks,
-    extract_search_replace_blocks,
-    remove_whitespace,
+    extract_search_replace_block,
+)
+from src.exceptions import (
+    EditCommandContentError,
+    EditCommandFormatError,
+    PrintStmtNotFoundError,
 )
 from src.interfaces.d4j import check_out_playground, run_single_test_playground
-from src.repograph.graph_searcher import Tag
-from src.schema import VerifyInput, VerifyResult
+from src.schema import VerifyInput
 
 
 @dataclass
@@ -37,10 +43,11 @@ class ProcessState:
     memory: Memory
     id: str
     edit_count: int = 0
+    retry_count: int = 0
     
     @property
     def edit_trace(self):
-        return f"Edits: {self.edit_count}/3"
+        return f"{self.edit_count}/{self.retry_count}"
 
 
 class ThreadStatusMonitor:
@@ -62,7 +69,7 @@ class ThreadStatusMonitor:
         table.add_column("Thread ID")
         table.add_column("Method")
         table.add_column("Status")
-        table.add_column("Edit Progress")
+        table.add_column("Edit/Retry")
         table.add_column("Last Update")
         
         with self.lock:
@@ -76,21 +83,15 @@ class ThreadStatusMonitor:
                 )
         return table
 
-
-
 class VerifyAgent:
     def __init__(
         self,
         bug_info: BugInfo,
-        model_name: str,
         max_workers: int = 5,
         debug: bool = False,
-        llm_args: Dict[str, Any] = {}
     ):
         self.bug_info = bug_info
-        self.model_name = model_name
         self.debug = debug
-        self.llm_args = llm_args
         self.processes: Dict[int, ProcessState] = {}
         self.process_counter = 0
         self.process_lock = threading.Lock()
@@ -102,8 +103,14 @@ class VerifyAgent:
             process_id = self.process_counter
             self.processes[process_id] = ProcessState(
                 verify_input=input,
-                llm=LLMBackend(),
-                memory=Memory(VERIFY_AGENT_SYSTEM_PROMPT, model_name=self.model_name),
+                llm=LLMBackend(
+                    api_key=self.bug_info.config.verify_model.api_key,
+                    base_url=self.bug_info.config.verify_model.base_url
+                ),
+                memory=Memory(
+                    VERIFY_AGENT_DEBUGGING_PROMPT,
+                    model_name=self.bug_info.config.verify_model.model
+                ),
                 id=str(process_id)
             )
             process = self.processes[process_id]
@@ -127,7 +134,7 @@ class VerifyAgent:
         monitor.update_status(
             process.id,
             process.verify_input.method.method_id,
-            "Running",
+            "Debugging",
             process.edit_trace
         )
         
@@ -140,104 +147,111 @@ class VerifyAgent:
         # prepare some initial information
         java_file: Path = playgroud_dir / self.bug_info.src_prefix / method.rel_fname
         assert java_file.exists(), f"Java file {java_file} does not exist"
-        java_back_file = java_file.with_suffix(".bak")
-        Path.replace(java_file, java_back_file)
-        
-        # these two variables will be updated in the loop
+        java_back_file = java_file.with_suffix(".bak")  # the initial version of the file
+        if not java_back_file.exists():
+            Path.replace(java_file, java_back_file)
         content = java_back_file.read_text()
         method_loc_interval = (method.line[0], method.line[1])
 
+        # start print debugging
+        retry_round = False
         while True:
-            # update the method code
-            input_dict = asdict(process.verify_input)
-            input_dict.update(
-                {
-                    'method_code': "\n".join(
-                        content.splitlines()[method_loc_interval[0]-1:method_loc_interval[1]]
-                    )
-                }
-            )
-            process.memory.messages[1].update(
-                {"content": VERIFY_AGENT_USER_PROMPT.format(**input_dict)}
-            )
-            
+            if retry_round:
+                # label the last two messages as retry messages
+                process.memory.retry_msg_idx.extend(
+                    [
+                        len(process.memory.messages) - 2,
+                        len(process.memory.messages) - 1
+                    ]
+                )
+
             response = process.llm.call(
                 messages=process.memory.get_messages(),
-                tools=VERIFY_AGENT_TOOLS,
-                model=self.model_name,
-                parallel_tool_calls=False,
-                **self.llm_args
+                model=self.bug_info.config.verify_model.model,
+                **self.bug_info.config.verify_model.llm_args.asdict()
             )
             message: ChatCompletionMessage = response.choices[0].message
+            process.memory.add_message({'role': 'assistant', 'content': message.content})
+            edit_command = extract_java_block(message.content)
             
-            if message.tool_calls:
-                tool_call = message.tool_calls[0]
-                process.edit_count += 1
+            if edit_command:
                 monitor.update_status(
                     process.id,
                     process.verify_input.method.method_id,
-                    "Running",
+                    "Debugging",
                     process.edit_trace
                 )
                 
-                edit_commands = json.loads(tool_call.function.arguments)["edits"]
-                edit_commands = [edit["edit"] for edit in edit_commands]
-                edit_result, content, method_loc_interval = edit_and_run(
-                    self.bug_info,
-                    process,
-                    edit_commands,
-                    playgroud_dir,
-                    java_file,
-                    content,
-                    method_loc_interval
-                )
-                
-                process.memory.add_message(message)
-                process.memory.add_message({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": edit_result,
-                })
+                try:
+                    edit_result = edit_and_run(
+                        self.bug_info,
+                        process,
+                        edit_command,
+                        playgroud_dir,
+                        java_file,
+                        content,
+                        method_loc_interval
+                    )
+                    process.edit_count += 1
+                    process.memory.add_message({"role": "user", "content": edit_result})
+                    retry_round = False
+                except Exception as e:
+                    process.retry_count += 1
+                    process.memory.add_message({"role": "user", "content": e.message})
+                    retry_round = True
             else:
-                llm_message = {'role': 'assistant', 'content': message.content}
-                process.memory.add_message(llm_message)
+                # LLM return the debug report
                 monitor.update_status(
                     process.id,
                     process.verify_input.method.method_id,
-                    "Completed",
+                    "Verifying",
                     process.edit_trace
                 )
                 break
+            
+        # start verifying
+        process.memory.add_message({"role": "user", "content": VERIFY_AGENT_RESULT_PROMPT})
+        while True:
+            response = process.llm.call(
+                messages=process.memory.get_messages(),
+                model=self.bug_info.config.verify_model.model,
+                **self.bug_info.config.verify_model.llm_args.asdict()
+            )
+            message: ChatCompletionMessage = response.choices[0].message
+            process.memory.add_message({'role': 'assistant', 'content': message.content})
+            result = extract_json_block(message.content)
+            
+            # check if the result is valid
+            if result is None:
+                process.retry_count += 1
+                error_message = f"Reponse format error, please return a JSON format verification result wrapped with ```json...``` block."
+                process.memory.add_message({"role": "user", "content": error_message})
+            else:
+                result = json.loads(result)
+                if result["category"] not in ["buggy", "benign", "uncertain"]:
+                    process.retry_count += 1
+                    error_message = f"Invalid verification result category: {result['category']}, should be one of ['buggy', 'benign', 'uncertain'], please try again."
+                    process.memory.add_message({"role": "user", "content": error_message})
+            
+            monitor.update_status(
+                process.id,
+                process.verify_input.method.method_id,
+                "Finished",
+                process.edit_trace
+            )
+            break
         
         # cleanup
         shutil.rmtree(playgroud_dir)
-
-    def read_results(self, verify_inputs: List[VerifyInput]) -> List[VerifyResult]:
-        res_file = verify_inputs[0].output_dir / "verify_results.json"
-        if res_file.exists():
-            res_dict = json.loads(res_file.read_text())
-            verify_results = []
-            for method_id, res in res_dict.items():
-                verify_results.append(
-                    VerifyResult(
-                        method_id=method_id,
-                        is_buggy=res["is_buggy"],
-                        explanation=res["explanation"]
-                    )
-                )
-            return verify_results
-        return None
     
     def run(self, inputs: List[VerifyInput]) -> List[Memory]:
-        results = self.read_results(inputs)
-        if results:
-            return results
-        
         monitor = ThreadStatusMonitor()
         self.futures = []
         
         # Create processes
         for input in inputs:
+            # if input.method.method_id != "com.google.javascript.jscomp.TypeCheck.visit#470-846":
+            #     continue
             process_id = self.create_process(input)
             future = self.thread_pool.submit(self.run_process, process_id, monitor)
             future.process_id = process_id
@@ -262,28 +276,23 @@ class VerifyAgent:
 def edit_and_run(
         bug_info: BugInfo,
         process: ProcessState,
-        edit_commands: List[str],
+        edit_command: str,
         playgroud_dir: Path,
         java_file: Path,
-        content: str | None,  # previous edited content
-        method_loc_interval: tuple[int, int],
+        content: str,
+        method_loc_interval: tuple[int, int]
     ):
-
-    output_file = playgroud_dir / "output.txt"
-    
-    # prepare input for the method editor
-    edits = [extract_search_replace_blocks(command)[0] for command in edit_commands]
-    start_line = max(method_loc_interval[0] - 6, 0)
-    end_line = method_loc_interval[1] + 4
     
     # apply the edits
-    new_content, extra_lines = apply_edit_commands(edits, content, (start_line, end_line))
-    method_loc_interval = (
-        method_loc_interval[0], method_loc_interval[1] + extra_lines
+    new_content, extra_lines = apply_edit_commands_search_replace(
+        edit_command,
+        content,
+        (method_loc_interval[0], method_loc_interval[1])
     )
     
     # transform print statements
-    new_loc_interval = (start_line, end_line + extra_lines)
+    new_loc_interval = (method_loc_interval[0], method_loc_interval[1] + extra_lines)
+    output_file = playgroud_dir / "output.txt"
     final_content = transform_print_stmt(new_content, output_file, new_loc_interval)
     
     # create the new file
@@ -291,63 +300,77 @@ def edit_and_run(
     
     # run the test
     output = run_single_test_playground(bug_info, playgroud_dir, process.verify_input.test_name)
-    
-    return output, new_content, method_loc_interval
+    return output
 
-def apply_edit_commands(commands, content, file_loc_interval: tuple[int, int]):
-    replaced = False
+def apply_edit_command_context_match(command: str, content: str, loc_interval: tuple[int, int]):
+    content_lines = content.splitlines()
+    window_lines = content_lines[loc_interval[0]:loc_interval[1]]
+    replace_code = extract_edit_block(command)
+    if replace_code is None:
+        raise Exception("Edit command format error. No edit block found.")
+
+    replace_lines = replace_code.splitlines()
+    # find the line interval need to be replaced
+    matcher = ContextMatcher(window_lines, replace_lines)
+    interval = matcher.find_context()
+    
+    start_line, end_line = interval
+    new_window_lines = window_lines[:start_line] + replace_lines + window_lines[end_line + 1:]
+    new_content = "\n".join(
+        content_lines[:loc_interval[0]]
+        + new_window_lines
+        + content_lines[loc_interval[1]:]
+    )
+
+    extra_lines = len(new_window_lines) - len(window_lines)
+    return new_content, extra_lines
+
+
+def apply_edit_commands_search_replace(edit_command: str, content: str, method_loc_interval: tuple[int, int]):
     extra_lines = 0
     content_lines = content.splitlines()
-    context_segment = "\n".join(
-        content_lines[file_loc_interval[0]:file_loc_interval[1]]
-    )
-    context_segment = remove_whitespace(context_segment)
+    
+    # create a window of the method for more precise replacement
+    start_line = max(method_loc_interval[0] - 6, 0)
+    end_line = method_loc_interval[1] + 6
+    
+    context_segment = "\n".join(content_lines[start_line:end_line])
     context_segment = "\n" + context_segment + "\n"
 
-    # first check for all edits.
-    can_apply = []
-    for subcommand in commands:
-        if not (
-            subcommand.startswith("<<")
-            and
-            subcommand.endswith("REPLACE")
-        ):
-            raise Exception(f"Wrong format for edit command: {subcommand}")
+    # first check edit.
+    match = extract_search_replace_block(edit_command)
+    if match is None:
+        raise EditCommandFormatError(edit_command)
+    search_text, replace_text = match
 
-        subcommand = "\n".join(subcommand.splitlines()[1:-1])
-        if len(subcommand.split("\n=======\n")) != 2:
-            raise Exception(f"Wrong format for edit command: {subcommand}")
+    if search_text not in context_segment:
+        raise EditCommandContentError(edit_command)
 
-        original, replace = subcommand.split("\n=======\n")
-        original = remove_whitespace(original)
-        replace = remove_whitespace(replace)
-        original = "\n" + original + "\n"
-        replace = "\n" + replace + "\n"
-
-        if original in context_segment:
-            can_apply.append((original, replace))
-        else:
-            raise Exception(f"Code block not found in the context:\n{original}")
-
-    # apply edits backwards
-    for original, replace in can_apply[::-1]:
-        if (
-            original in context_segment
-        ):  # This may not be true after some previously applied edits
-            context_segment = context_segment.replace(original, replace)
-            replaced = True
-            extra_lines += replace.count("\n") - original.count("\n")
+    # apply edits
+    context_segment = context_segment.replace(search_text, replace_text)
+    extra_lines += replace_text.count("\n") - search_text.count("\n")
     # reassembly
     content = (
-        "\n".join(content_lines[:file_loc_interval[0]])
+        "\n".join(content_lines[:start_line])
         + context_segment
-        + "\n".join(content_lines[file_loc_interval[1]:])
+        + "\n".join(content_lines[end_line:])
     )
 
-    if not replaced:
-        raise Exception("No edit was applied. Please check the edit commands.")
-
     return content, extra_lines
+
+
+def apply_edit_command_all_method(command: str, content: str, loc_interval: tuple[int, int]):
+    content_lines = content.splitlines()
+    replace_lines = command.splitlines()
+
+    new_content = "\n".join(
+        content_lines[:loc_interval[0] - 1]
+        + replace_lines
+        + content_lines[loc_interval[1]:]
+    )
+
+    extra_lines = len(replace_lines) - (loc_interval[1] - loc_interval[0] + 1)
+    return new_content, extra_lines
 
 def transform_print_stmt(
         content: str,
@@ -359,7 +382,8 @@ def transform_print_stmt(
     )
     context_segment = "\n" + context_segment + "\n"
     
-    # transform print statements to write to a file
+    # the junit framework intercepted the standard input and output
+    # so we transform print statements to write to a file
     write_stmt = (
         'try {{ Path filePath = Paths.get("{output_file}"); '
         'Files.write(filePath, ({output_str} + "\\n").getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND); }} '
@@ -367,7 +391,7 @@ def transform_print_stmt(
     )
     matches = extract_print_blocks(context_segment)
     if not matches:
-        print("Warning: No print statements found in the edited method.")
+        raise PrintStmtNotFoundError(context_segment)
     for print_stmt, arguments in matches:
         context_segment = context_segment.replace(
             print_stmt,

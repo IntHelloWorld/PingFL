@@ -4,12 +4,12 @@ from typing import List, Optional, Tuple
 
 import networkx as nx
 
-from interfaces.method_extractor import JMethod
+from src.interfaces.method_extractor import JMethod
 
 
 @dataclass
 class Tag():
-    """Represents a code element tag"""
+    """Represents a code element in the source file."""
     rel_fname: str
     fname: str 
     line: Tuple[int, int]
@@ -22,9 +22,13 @@ class Tag():
     interfaces: Tuple[str] = ()
     is_test: bool = False
     
-    # these fields are for methods, they will be filled after instrumentation
+    # outer class name is filled for all methods
+    # since it can be extrated from the Java file name
     outer_class: str = None
+    
+    # for covered methods, these field will be filled after instrumentation
     inner_class: str = None
+    is_covered: bool = False
     
     def __hash__(self):
         return hash((self.rel_fname, self.line, self.name, self.kind, self.category))
@@ -45,6 +49,31 @@ class Tag():
             return f'{self.inner_class}.{self.name}#{self.line[0]}-{self.line[1]}'
         return f'{self.name}#{self.line[0]}-{self.line[1]}'
 
+@dataclass
+class CGMethodNode:
+    """Represents a method node in the call graph constructed by Java agent."""
+    package: str
+    class_name: str
+    method_name: str
+    start_line: int
+    end_line: int
+    
+    @property
+    def signature(self):
+        return f"{self.package}@{self.class_name}:{self.method_name}({self.start_line}-{self.end_line})"
+    
+    @property
+    def inner_class(self):
+        if '$' in self.class_name:
+            return '$'.join(self.class_name.split('$')[1:])
+        return None
+    
+    @property
+    def outer_class(self):
+        return self.class_name.split('$')[0]
+    
+    def __hash__(self):
+        return hash(self.signature)
 
 @dataclass
 class TestCase:
@@ -84,7 +113,8 @@ class DebugInput:
     test_name: str
     test_code: str
     error_message: str
-    test_graph: nx.Graph
+    repo_graph: nx.Graph
+    loaded_classes: List[str]
     output_path: Path
 
 
@@ -118,8 +148,9 @@ class VerifyInput:
 @dataclass
 class VerifyResult:
     method_id: str
-    is_buggy: bool
+    category: str
     explanation: str
+    suggestion: str
 
 
 @dataclass

@@ -22,12 +22,7 @@ from src.core.prompt import (
     VERIFY_AGENT_VERIFIER_USER_PROMPT,
     MethodVerifyResult,
 )
-from src.core.utils import (
-    extract_json_blocks,
-    extract_print_blocks,
-    extract_search_replace_blocks,
-    remove_whitespace,
-)
+from src.core.utils import extract_print_blocks, remove_whitespace
 from src.interfaces.d4j import check_out_playground, run_single_test_playground
 from src.repograph.graph_searcher import Tag
 
