@@ -24,17 +24,17 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "class_name": {
                         "type": "string",
-                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'."
-                    }
+                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'.",
+                    },
                 },
                 "required": ["thought", "class_name"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
@@ -46,21 +46,21 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "class_name": {
                         "type": "string",
-                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'."
+                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'.",
                     },
                     "method_name": {
                         "type": "string",
-                        "description": "The method name. Directly input the method name such as 'myMethod'."
-                    }
+                        "description": "The method name. Directly input the method name such as 'myMethod'.",
+                    },
                 },
                 "required": ["thought", "class_name", "method_name"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
@@ -72,17 +72,17 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "string_content": {
                         "type": "string",
-                        "description": "The string content to search for, requires proper indentation."
+                        "description": "The string content to search for, requires proper indentation.",
                     },
                 },
                 "required": ["thought", "string_content"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
@@ -94,17 +94,17 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "method_id": {
                         "type": "string",
-                        "description": "The method id to search for its callers."
+                        "description": "The method id to search for its callers.",
                     },
                 },
                 "required": ["thought", "method_id"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
@@ -116,18 +116,18 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "method_id": {
                         "type": "string",
-                        "description": "The method id to search for its callees."
+                        "description": "The method id to search for its callees.",
                     },
                 },
                 "required": ["thought", "method_id"],
-                "additionalProperties": False
-            }
-        }
-    }
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -173,18 +173,64 @@ NOTE:
 - Focus on concrete evidence rather than speculation.
 """
 
-SEARCH_AGENT_RESULT_PROMPT = """
-Based on the debug report, please provide a detailed error analysis and the id of the suspicious method in a structured JSON format.
+SEARCH_AGENT_RESULT_PROMPT_SINGLE = """
+Based on the debug report, please provide the most suspicious method in the following JSON format.
 
-You should provide a final debugging result in the following JSON format:
 ```json
 {
-    "error_analysis": "string",         // Detailed explanation of why this method is suspicious
-    "suspicious_method": "string"       // The method id, e.g., 'com.example.MyClass.InnerClass.methodName#20-30'
+    "error_analysis": "string",  // Detailed explanation of why this method is suspicious
+    "method_id": "string"        // The method id, e.g., 'com.example.MyClass.InnerClass.methodName#20-30'
 }
 ```
 
-Now, please provide the JSON result wrapped with the ```json...``` block.
+NOTE:
+1. DO NOT provide a test method as the suspicious method, as we are looking for the production method that may cause the test failure.
+2. Wrap the JSON result in the ```json...``` block.
+"""
+
+SEARCH_AGENT_RESULT_PROMPT_MULTIPLE = """
+Based on the debug report, please provide **UP TO 3** most suspicious methods that needs to be further investigated in the structured JSON format.
+
+Each method should be represented as an object with the following schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "error_analysis": {
+      "type": "string",
+      "description": "Detailed explanation of why this method is suspicious"
+    },
+    "method_id": {
+      "type": "string",
+      "description": "The method id, e.g., 'com.example.MyClass.InnerClass.methodName#20-30'"
+    }
+  }
+}
+```
+
+Please ensure that:
+
+1. Provide up to 3 most suspicious methods.
+2. Each method is unique and contains a valid `method_id` (e.g., `com.example.MyClass.InnerClass.methodName#20-30`).
+3. The `error_analysis` field provides a detailed explanation of why the method is considered suspicious (e.g., potential vulnerabilities, bad practices, or anomalous behavior).
+4. The output is a JSON array of objects, where each object adheres to the schema above.
+5. The output is wrapped with the ```json...``` block.
+
+For example, the output should look like this:
+
+```json
+[
+  {
+    "error_analysis": "This method lacks proper input validation, which may lead to the test failure.",
+    "method_id": "com.example.AuthService.login#45-55"
+  },
+  {
+    "error_analysis": "This method contains a potential issue with the data processing logic.",
+    "method_id": "com.example.DataProcessor.processData#120-130"
+  }
+]
+```
 """
 
 SEARCH_AGENT_USER_PROMPT = """
@@ -308,4 +354,62 @@ The method looks like:
 ```java
 {method_code}
 ```
+"""
+
+SUMMARIZE_SYSTEM_PROMPT = """You are a Software Debugging Assistant."""
+
+SUMMARIZE_USER_PROMPT = """
+The previous debugging process found the Java method that may cause the test failure for each failed test case. Now, given the information of each failed test case and its corresponding suspicious method information, please sort all candidate methods in descending order according to their suspicion and provide the user with a sorted list of methods.
+
+# Failed Test Cases and the Corresponding Suspicious Methods
+
+{result_report}
+
+# Result Format
+
+You should provide a method rank list, each method should be in the following JSON format:
+```json
+{
+    "method_id": "string",      // The method id, e.g., 'com.example.MyClass.InnerClass.methodName#20-30'
+    "explanation": "string",   // Detailed explanation of why this method is suspicious
+}
+```
+
+An example of the output:
+```json
+[
+  {
+    "method_id": "com.example.AuthService.login#45-55",
+    "explanation": "This method lacks proper input validation, which may lead to the test failure."
+  },
+  {
+    "method_id": "com.example.DataProcessor.processData#120-130",
+    "explanation": "This method contains a potential issue with the data processing logic."
+  }
+]
+
+# NOTE
+- A method is more suspicious if it is likely to cause more test cases to fail.
+- The method rank list should be sorted in descending order according to the suspicion level.
+- Wrap your output in the ```json...``` block.
+
+Now, please provide the sorted list of methods.
+"""
+
+SINGLE_RESULT_TEMPLATE = """
+## Debugging Result for Test Case `{test_name}`
+
+Test Code:
+```java
+{test_code}
+```
+
+Error Message:
+```
+{error_message}
+```
+
+Suspicious Method ID: `{method_id}`
+
+Explanation: {explanation}
 """

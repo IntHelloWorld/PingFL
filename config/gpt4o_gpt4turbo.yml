@@ -4,18 +4,21 @@ dependencies:
 search_model:
   series: openai
   model: gpt-4o-2024-11-20
-  api_key: sk-MgVoec6jovmmDqAWaeQF58DrOeIPO681PzmCqrb16NczeU1V
-  base_url: https://api.kksj.org/v1
+  api_key: sk-HgK8u1JLa9TIX8iS5vfiTRERJHCy92jAvBmOtBPFZ5Y3GTly
+  base_url: https://www.dmxapi.cn/v1
   llm_args:
     temperature: 0.7
 verify_model:
   series: openai
   model: gpt-4-turbo-2024-04-09
-  api_key: sk-MgVoec6jovmmDqAWaeQF58DrOeIPO681PzmCqrb16NczeU1V
-  base_url: https://api.kksj.org/v1
+  api_key: sk-HgK8u1JLa9TIX8iS5vfiTRERJHCy92jAvBmOtBPFZ5Y3GTly
+  base_url: https://www.dmxapi.cn/v1
   llm_args:
     temperature: 0.7
 hyper:
   parallel_search: false
+  debug_workers: 5
+  search_workers: 5
+  verify_workers: 5
   max_test_cases: 5
   debug_rounds: 3

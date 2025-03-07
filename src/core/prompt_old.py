@@ -22,17 +22,17 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "class_name": {
                         "type": "string",
-                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'."
-                    }
+                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'.",
+                    },
                 },
                 "required": ["thought", "class_name"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
@@ -44,24 +44,23 @@ SEARCH_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your analysis and the reason for the tool call."
+                        "description": "A text to describe your analysis and the reason for the tool call.",
                     },
                     "class_name": {
                         "type": "string",
-                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'."
+                        "description": "The class name. For precise matches, input the full class name such as 'com.example.MyClass'. For fuzzy matches, input a partial class name such as 'MyClass'.",
                     },
                     "method_name": {
                         "type": "string",
-                        "description": "The method name. Directly input the method name such as 'myMethod'."
-                    }
+                        "description": "The method name. Directly input the method name such as 'myMethod'.",
+                    },
                 },
                 "required": ["thought", "class_name", "method_name"],
-                "additionalProperties": False
-            }
-        }
-    }
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
-
 
 
 VERIFY_AGENT_TOOLS = [
@@ -75,7 +74,7 @@ VERIFY_AGENT_TOOLS = [
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "A text to describe your thought and the reason for the tool call."
+                        "description": "A text to describe your thought and the reason for the tool call.",
                     },
                     "edits": {
                         "type": "array",
@@ -100,18 +99,18 @@ VERIFY_AGENT_TOOLS = [
                                         ">>>>>> REPLACE\n\n"
                                         "Please note that the *SEARCH/REPLACE* edit REQUIRES PROPER INDENTATION. "
                                         "If you would like to search the line '    System.out.println(x);', you must fully write that out, with all those spaces before the code!"
-                                    )
+                                    ),
                                 },
                             },
                             "required": ["edit"],
-                            "additionalProperties": False
-                        }
-                    }
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "required": ["thought", "edits"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     }
 ]
 
@@ -143,11 +142,11 @@ VERIFY_AGENT_TOOLS_CLAUDE = [
                         "    System.out.println(y);\n"
                         "    return x + y;\n"
                         "}\n"
-                    )
+                    ),
                 },
             },
             "required": ["edited_method"],
-        }
+        },
     }
 ]
 
@@ -163,11 +162,11 @@ VERIFY_AGENT_TOOLS_OPENAI = [
                 "properties": {
                     "start_line": {
                         "type": "integer",
-                        "description": "The start line number of the original code that needs to be replaced."
+                        "description": "The start line number of the original code that needs to be replaced.",
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "The end line number of the original code that needs to be replaced."
+                        "description": "The end line number of the original code that needs to be replaced.",
                     },
                     "replace_code": {
                         "type": "string",
@@ -176,18 +175,18 @@ VERIFY_AGENT_TOOLS_OPENAI = [
                             "```java\n"
                             "    try {\n"
                             "        Integer.parseInt(input);\n"
-                            "        System.out.println(\"Input is\" + input);\n"
+                            '        System.out.println("Input is" + input);\n'
                             "        return true;\n"
                             "    } catch (NumberFormatException e) {\n"
                             "        return false;\n"
                             "```"
-                        )
+                        ),
                     },
                 },
                 "required": ["start_line", "end_line", "replace_code"],
-                "additionalProperties": False
-            }
-        }
+                "additionalProperties": False,
+            },
+        },
     }
 ]
 

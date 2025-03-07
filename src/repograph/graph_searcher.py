@@ -46,7 +46,7 @@ class RepoSearcher:
         self.method_dict = method_dict
         self.method_id_map = method_id_map
     
-    def get_method(self, method_id):
+    def get_method(self, method_id) -> Tag:
         return self.method_id_map[method_id]
 
     def get_predecessors(self, node, edge_type):
@@ -70,21 +70,37 @@ class RepoSearcher:
         if self.covered_classes_result:
             return self.covered_classes_result
         
-        covered_classes = {}
-        for loaded_class in self.loaded_classes:
-            if loaded_class == '':
-                continue
-            class_name = loaded_class.split('.')[-1]
-            pkg_name = '.'.join(loaded_class.split('.')[:-1])
-            try:
-                covered_classes[pkg_name].append(class_name)
-            except KeyError:
-                covered_classes[pkg_name] = [class_name]
-        assert len(covered_classes) > 0
+        covered_test_classes = {}
+        covered_source_classes = {}
+        for node in self.graph.nodes(data=True):
+            if node[0].category == 'function':
+                method_node: Tag = node[0]
+                if method_node.is_covered:
+                    if method_node.inner_class:
+                        full_class_name = f'{method_node.outer_class}.{method_node.inner_class}'
+                    else:
+                        full_class_name = method_node.outer_class
+                    if method_node.is_test:
+                        try:
+                            if full_class_name not in covered_test_classes[method_node.pkg_name]:
+                                covered_test_classes[method_node.pkg_name].append(full_class_name)
+                        except KeyError:
+                            covered_test_classes[method_node.pkg_name] = [method_node.outer_class]
+                    else:
+                        try:
+                            if full_class_name not in covered_source_classes[method_node.pkg_name]:
+                                covered_source_classes[method_node.pkg_name].append(full_class_name)
+                        except KeyError:
+                            covered_source_classes[method_node.pkg_name] = [method_node.outer_class]
         
-        template = "Covered classes grouped with package name:\n{covered_classes}"
+        template = (
+            "Covered classes grouped with package name:\n\n"
+            "Covered source classes:\n{covered_source_classes}\n\n"
+            "Covered test classes:\n{covered_test_classes}"
+        )
         result = template.format(
-            covered_classes=json.dumps(covered_classes, indent=2),
+            covered_source_classes=json.dumps(covered_source_classes),
+            covered_test_classes=json.dumps(covered_test_classes)
         )
         self.covered_classes_result = result
         return result
