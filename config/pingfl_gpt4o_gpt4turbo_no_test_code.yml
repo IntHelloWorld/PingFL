@@ -1,0 +1,35 @@
+agent: pingfl
+dependencies:
+  java_agent_lib: /home/qyh/projects/FixFL/MethodCallGraphBuilder/target/MethodCallGraphBuilder-1.0.jar
+  bug_exec: /home/qyh/DATASET/defects4j-2.0.1/framework/bin/defects4j
+search_model:
+  org: openai
+  model: gpt-4o-2024-11-20
+  api_key:
+  base_url:
+  llm_args:
+    temperature: 0
+verify_model:
+  org: openai
+  model: gpt-4-turbo-2024-04-09
+  api_key:
+  base_url:
+  llm_args:
+    temperature: 0
+hyper:
+  debug_workers: 5
+  search_workers: 1
+  max_test_cases: 5
+  max_tool_calls: 30
+  max_verify_rounds: 3
+  max_edit_count: 3
+  max_retry_count: 5
+  max_parallel_tool_calls: 1
+  max_search_paths: 1
+  use_ablation: true
+ablation:
+  test_code: true
+  test_output: false
+  stack_trace: false
+  suspected_issue: false
+  thought: false

@@ -1,0 +1,56 @@
+Closure_28 no changed method found in buggy code
+Closure_137 no changed method found in buggy code
+Closure_144 no changed method found in buggy code
+Closure_149 no changed method found in buggy code
+Closure_155 no changed method found in buggy code
+Closure_162 no changed method found in buggy code
+Closure_165 no changed method found in buggy code
+Closure_169 Warning: /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Closure@169/fixed/src/com/google/javascript/rhino/jstype/EquivalenceMethod.java or /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Closure@169/buggy/src/com/google/javascript/rhino/jstype/EquivalenceMethod.java not exists.
+Lang_23 no changed method found in buggy code
+Lang_25 no changed method found in buggy code
+Lang_43 runtime error
+Lang_56 no changed method found in buggy code
+Math_12 no changed method found in buggy code
+Math_104 no changed method found in buggy code
+Mockito_26 no changed method found in buggy code
+Time_11 no changed method found in buggy code
+Time_26 no changed method found in buggy code
+Cli_7 no changed method found in buggy code
+Cli_13 no changed method found in buggy code
+Cli_16 no changed method found in buggy code
+Cli_21 no changed method found in buggy code
+Cli_31 no changed method found in buggy code
+Cli_34 no changed method found in buggy code
+Cli_36 no changed method found in buggy code
+Codec_7 'utf-8' codec can't decode byte 0xe9 in position 2823: invalid continuation byte
+Codec_12 no changed method found in buggy code
+Codec_13 Warning: /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Codec@13/fixed/src/main/java/org/apache/commons/codec/binary/CharSequenceUtils.java or /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Codec@13/buggy/src/main/java/org/apache/commons/codec/binary/CharSequenceUtils.java not exists.
+Codec_14 no changed method found in buggy code
+Codec_16 no changed method found in buggy code
+Compress_7 'utf-8' codec can't decode byte 0xb1 in position 5090: invalid start byte
+Compress_8 'utf-8' codec can't decode byte 0xb1 in position 7037: invalid start byte
+Compress_33 no changed method found in buggy code
+Compress_42 no changed method found in buggy code
+Csv_12 no changed method found in buggy code
+Csv_13 no changed method found in buggy code
+Gson_9 no changed method found in buggy code
+JacksonDatabind_15 no changed method found in buggy code
+JacksonDatabind_20 no changed method found in buggy code
+JacksonDatabind_21 no changed method found in buggy code
+JacksonDatabind_26 no changed method found in buggy code
+JacksonDatabind_52 no changed method found in buggy code
+JacksonDatabind_53 no changed method found in buggy code
+JacksonDatabind_59 no changed method found in buggy code
+JacksonDatabind_89 no changed method found in buggy code
+JacksonDatabind_92 no changed method found in buggy code
+JacksonDatabind_103 no changed method found in buggy code
+Jsoup_9 no changed method found in buggy code
+Jsoup_17 no changed method found in buggy code
+Jsoup_23 no changed method found in buggy code
+Jsoup_25 no changed method found in buggy code
+Jsoup_28 no changed method found in buggy code
+Jsoup_31 no changed method found in buggy code
+Jsoup_58 no changed method found in buggy code
+Jsoup_71 Warning: /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Jsoup@71/fixed/src/main/java/org/jsoup/nodes/PseudoTextElement.java or /home/qyh/projects/FixFL/DebugResult/aab37398d3e33533fb0cbc4d13167939/Jsoup@71/buggy/src/main/java/org/jsoup/nodes/PseudoTextElement.java not exists.
+Jsoup_87 no changed method found in buggy code
+Jsoup_92 no changed method found in buggy code

@@ -1,0 +1,7 @@
+dataset/bugInfo
+DebugResult
+EvaluationResult
+.vscode
+utils
+config_old
+__pycache__/
